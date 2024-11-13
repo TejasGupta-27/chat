@@ -1,127 +1,157 @@
 #include <iostream>
+#include <thread>
+#include <mutex>
+#include <map>
+#include <set>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <algorithm>
 #include <sstream>
-#include <thread>
-#include <unordered_map>
-#include <mutex>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <string.h>
-#include <sys/wait.h>
 
-struct Client {
-    int socket;
-    std::string username;
-    int room_id;
-};
+#define PORT 8080
+#define BUFFER_SIZE 1024
 
-std::vector<std::string> rooms = {"General", "Tech", "Music"};
-std::vector<std::vector<Client>> room_clients(rooms.size());
-std::unordered_map<int, Client> clients;
-std::mutex clients_mutex; // Mutex to protect shared resources
+std::map<int, std::string> client_usernames; // Map client socket -> username
+std::map<int, std::string> client_rooms;    // Map client socket -> current room
+std::map<std::string, std::set<int>> rooms; // Map room name -> set of client sockets
+std::mutex clients_mutex;
 
-void broadcastMessage(int sender_socket, const std::string& message, int room_id) {
-    // Locking the shared room_clients to prevent race conditions
+// Helper function to send a message to a specific client
+void send_to_client(int client_socket, const std::string &message) {
+    send(client_socket, message.c_str(), message.length(), 0);
+}
+
+// Broadcast a message to all clients in the same room
+void broadcast_to_room(const std::string &room, const std::string &message, int sender_socket) {
     std::lock_guard<std::mutex> lock(clients_mutex);
 
-    for (const Client& client : room_clients[room_id]) {
-        if (client.socket != sender_socket) {
-            send(client.socket, message.c_str(), message.length(), 0);
+    if (rooms.find(room) != rooms.end()) {
+        for (int client_socket : rooms[room]) {
+            if (client_socket != sender_socket) { // Don't send to the sender
+                send_to_client(client_socket, message);
+            }
         }
     }
 }
 
-void handleClient(int client_socket) {
-    char buffer[1024];
-    Client client;
-    client.socket = client_socket;
+// Handle client messages
+void handle_client(int client_socket) {
+    char buffer[BUFFER_SIZE];
+    std::string username;
+    std::string current_room = "General"; // Default room
 
-    // Ask for username
-    send(client_socket, "Enter your username: ", 21, 0);
-    int n = recv(client_socket, buffer, sizeof(buffer), 0);
-    if (n > 0) {
-        client.username = std::string(buffer, n);
-    }
-
-    // Ask for room
-    send(client_socket, "Enter room (General, Tech, Music): ", 34, 0);
-    memset(buffer, 0, sizeof(buffer));
-    n = recv(client_socket, buffer, sizeof(buffer), 0);
-    if (n > 0) {
-        std::string room_name(buffer, n);
-        auto it = std::find(rooms.begin(), rooms.end(), room_name);
-        client.room_id = (it != rooms.end()) ? std::distance(rooms.begin(), it) : 0; // Default to General
-    }
-
-    // Lock the room_clients for thread-safe insertion
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
-        room_clients[client.room_id].push_back(client);
-        clients[client_socket] = client;
+        client_rooms[client_socket] = current_room;
+        rooms[current_room].insert(client_socket);
     }
 
-    // Notify the room
-    std::string welcome_message = "Welcome to the " + rooms[client.room_id] + " room, " + client.username + "!\n";
-    send(client_socket, welcome_message.c_str(), welcome_message.length(), 0);
+    // Welcome the user
+    send_to_client(client_socket, "Welcome to the chat server!\n");
+    send_to_client(client_socket, "You have joined the General room.\n");
 
     while (true) {
-        memset(buffer, 0, sizeof(buffer));
-        n = recv(client_socket, buffer, sizeof(buffer), 0);
-        if (n <= 0) {
+        memset(buffer, 0, BUFFER_SIZE);
+        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+
+        if (bytes_received <= 0) {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            std::cout << "Client disconnected: " << client_socket << std::endl;
+
+            // Remove client from their current room
+            rooms[current_room].erase(client_socket);
+            if (rooms[current_room].empty()) {
+                rooms.erase(current_room);
+            }
+
+            client_usernames.erase(client_socket);
+            client_rooms.erase(client_socket);
+            close(client_socket);
             break;
         }
-        std::string message = client.username + ": " + std::string(buffer, n);
-        broadcastMessage(client_socket, message, client.room_id);
-    }
 
-    // Lock for removing the client from the room
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        room_clients[client.room_id].erase(std::remove_if(room_clients[client.room_id].begin(), room_clients[client.room_id].end(), 
-            [client_socket](const Client& c) { return c.socket == client_socket; }), room_clients[client.room_id].end());
-        clients.erase(client_socket);
+        std::string message(buffer);
+        std::cout << "Received from client " << client_socket << ": " << message << std::endl;
+
+        // Handle special commands
+        if (message.find("/username ") == 0) {
+            username = message.substr(10);
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            client_usernames[client_socket] = username;
+            send_to_client(client_socket, "Username set to " + username + "\n");
+        } else if (message.find("/change_room ") == 0) {
+            std::string new_room = message.substr(13);
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex);
+
+                // Leave current room
+                rooms[current_room].erase(client_socket);
+                if (rooms[current_room].empty()) {
+                    rooms.erase(current_room);
+                }
+
+                // Join new room
+                current_room = new_room;
+                client_rooms[client_socket] = current_room;
+                rooms[current_room].insert(client_socket);
+            }
+            send_to_client(client_socket, "You have joined the room: " + current_room + "\n");
+        } else {
+            // Broadcast the message to the current room
+            std::string full_message = username + ": " + message;
+            broadcast_to_room(current_room, full_message, client_socket);
+        }
     }
-    close(client_socket);
 }
 
+// Main server function
 int main() {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        std::cerr << "Failed to create socket\n";
-        return 1;
+    int server_socket, client_socket;
+    sockaddr_in server_addr{}, client_addr{};
+    socklen_t addr_len = sizeof(client_addr);
+
+    // Create socket
+    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Socket failed");
+        exit(EXIT_FAILURE);
     }
 
-    sockaddr_in server_addr;
+    // Bind to port
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(8080);
+    server_addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        std::cerr << "Bind failed\n";
-        return 1;
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_socket);
+        exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 5) == -1) {
-        std::cerr << "Listen failed\n";
-        return 1;
+    // Listen for connections
+    if (listen(server_socket, 10) < 0) {
+        perror("Listen failed");
+        close(server_socket);
+        exit(EXIT_FAILURE);
     }
 
-    std::cout << "Server is listening on port 8080...\n";
+    std::cout << "Server started. Listening on port " << PORT << "...\n";
 
+    // Accept client connections in a loop
     while (true) {
-        int client_socket = accept(server_fd, NULL, NULL);
-        if (client_socket < 0) {
-            std::cerr << "Client accept failed\n";
+        if ((client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &addr_len)) < 0) {
+            perror("Accept failed");
             continue;
         }
 
-        // Create a new thread to handle the client
-        std::thread client_thread(handleClient, client_socket);
-        client_thread.detach(); // Detach the thread to let it run independently
+        std::cout << "New connection: " << client_socket << std::endl;
+
+        // Create a thread to handle the new client
+        std::thread(handle_client, client_socket).detach();
     }
 
-    close(server_fd);
+    close(server_socket);
     return 0;
 }
