@@ -13,60 +13,52 @@
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
+// Add message history storage
+struct RoomData {
+    std::set<int> clients;
+    std::vector<std::string> message_history;
+};
 
-std::map<int, std::string> client_usernames; // Map client socket -> username
-std::map<int, std::string> client_rooms;    // Map client socket -> current room
-std::map<std::string, std::set<int>> rooms; // Map room name -> set of client sockets
+std::map<int, std::string> client_usernames;
+std::map<int, std::string> client_rooms;
+std::map<std::string, RoomData> rooms;
 std::mutex clients_mutex;
 
-// Helper function to send a message to a specific client
-void send_to_client(int client_socket, const std::string &message) {
-    send(client_socket, message.c_str(), message.length(), 0);
-}
-
-// Broadcast a message to all clients in the same room
-void broadcast_to_room(const std::string &room, const std::string &message, int sender_socket) {
+// Modified send_to_client to handle message history
+void send_message_history(int client_socket, const std::string &room) {
     std::lock_guard<std::mutex> lock(clients_mutex);
-
     if (rooms.find(room) != rooms.end()) {
-        for (int client_socket : rooms[room]) {
-            if (client_socket != sender_socket) { // Don't send to the sender
-                send_to_client(client_socket, message);
-            }
+        for (const auto &message : rooms[room].message_history) {
+            send(client_socket, message.c_str(), message.length(), 0);
         }
     }
 }
 
-// Handle client messages
 void handle_client(int client_socket) {
-    char buffer[BUFFER_SIZE];
+    char buffer[1024];
     std::string username;
-    std::string current_room = "General"; // Default room
+    std::string current_room = "General";
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         client_rooms[client_socket] = current_room;
-        rooms[current_room].insert(client_socket);
+        rooms[current_room].clients.insert(client_socket);
     }
 
-    // Welcome the user
-    send_to_client(client_socket, "Welcome to the chat server!\n");
-    send_to_client(client_socket, "You have joined the General room.\n");
+    // Send room history when client joins
+    send_message_history(client_socket, current_room);
 
     while (true) {
-        memset(buffer, 0, BUFFER_SIZE);
-        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+        memset(buffer, 0, 1024);
+        int bytes_received = recv(client_socket, buffer, 1024, 0);
 
         if (bytes_received <= 0) {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            std::cout << "Client disconnected: " << client_socket << std::endl;
-
-            // Remove client from their current room
-            rooms[current_room].erase(client_socket);
-            if (rooms[current_room].empty()) {
+            rooms[current_room].clients.erase(client_socket);
+            if (rooms[current_room].clients.empty() && 
+                rooms[current_room].message_history.empty()) {
                 rooms.erase(current_room);
             }
-
             client_usernames.erase(client_socket);
             client_rooms.erase(client_socket);
             close(client_socket);
@@ -74,38 +66,39 @@ void handle_client(int client_socket) {
         }
 
         std::string message(buffer);
-        std::cout << "Received from client " << client_socket << ": " << message << std::endl;
 
-        // Handle special commands
         if (message.find("/username ") == 0) {
             username = message.substr(10);
             std::lock_guard<std::mutex> lock(clients_mutex);
             client_usernames[client_socket] = username;
-            send_to_client(client_socket, "Username set to " + username + "\n");
-        } else if (message.find("/change_room ") == 0) {
+        }
+        else if (message.find("/change_room ") == 0) {
             std::string new_room = message.substr(13);
             {
                 std::lock_guard<std::mutex> lock(clients_mutex);
-
-                // Leave current room
-                rooms[current_room].erase(client_socket);
-                if (rooms[current_room].empty()) {
-                    rooms.erase(current_room);
-                }
-
-                // Join new room
+                rooms[current_room].clients.erase(client_socket);
                 current_room = new_room;
                 client_rooms[client_socket] = current_room;
-                rooms[current_room].insert(client_socket);
+                rooms[current_room].clients.insert(client_socket);
             }
-            send_to_client(client_socket, "You have joined the room: " + current_room + "\n");
-        } else {
-            // Broadcast the message to the current room
-            std::string full_message = username + ": " + message;
-            broadcast_to_room(current_room, full_message, client_socket);
+            // Send history of new room
+            send_message_history(client_socket, new_room);
+        }
+        else {
+            std::string full_message = username + ": " + message + "\n";
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            // Store message in room history
+            rooms[current_room].message_history.push_back(full_message);
+            // Broadcast to other clients
+            for (int client : rooms[current_room].clients) {
+                if (client != client_socket) {
+                    send(client, full_message.c_str(), full_message.length(), 0);
+                }
+            }
         }
     }
 }
+
 
 // Main server function
 int main() {
